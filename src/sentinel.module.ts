@@ -62,7 +62,11 @@ export class SentinelModule implements NestModule {
       });
     }
 
-    return { module: SentinelModuleForRoot, providers, exports: providers };
+    // APP_INTERCEPTOR (like APP_GUARD/APP_FILTER) is a special multi-provider token NestJS
+    // registers globally the moment it's declared in ANY loaded module's `providers` — it must
+    // NOT also be re-exported (Nest throws UnknownExportException: "cannot export a
+    // provider/module that is not a part of the currently processed module" if you try).
+    return { module: SentinelModuleForRoot, providers, exports: [] };
   }
 
   configure(_consumer: MiddlewareConsumer): void {
