@@ -4,5 +4,6 @@ export * from './auth';
 export * from './headers';
 export * from './resource';
 export * from './traceid';
+export * from './auditlog';
 export * from './sentinel.module';
 

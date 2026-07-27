@@ -27,7 +27,8 @@ Peer dependencies (already present in any NestJS/Express app): `@nestjs/common`,
 | `ratelimit` | `RateLimitGuard` | Token-bucket rate limiting, per-key/IP. | A04 |
 | `resource` | `TimeoutInterceptor` | Per-request wall-clock timeout (RxJS `timeout` operator). | resource exhaustion (A05-adjacent) |
 | `validate` | `nonEmpty`, `maxLength`, `oneOf` | Handler-boundary input validation. | A03 |
-| `sentinel` | `SentinelModule` | Single-import wiring for the global, stateless middleware (`traceid`, `headers`). | — |
+| `auditlog` | `AuditLogInterceptor` | Structured, optionally tamper-evident who/what/when/how audit trail per request, emitted to a pluggable `sink`. | A09 (A08 with `tamperEvident: true`) |
+| `sentinel` | `SentinelModule` | Single-import wiring for the global, stateless middleware (`traceid`, `headers`, and — if configured — `auditlog`). | — |
 
 See [`docs/owasp-coverage.md`](docs/owasp-coverage.md) for the full OWASP Top 10 (2021) mapping.
 
@@ -40,6 +41,12 @@ NestJS guards are meant to be applied (not global-by-default the way middleware 
 routes need auth/rate-limiting is application-specific. `TimeoutInterceptor` is likewise applied
 per-controller/route via `@UseInterceptors`.
 
+`AuditLogInterceptor` is wired through `SentinelModule.forRoot({ auditLog: {...} })` too, as an
+`APP_INTERCEPTOR` — unlike the guards, most consumers want *every* request audited rather than a
+manually-curated subset, so it defaults to global-by-default when the `auditLog` key is supplied
+(omit the key to skip audit logging entirely, or apply `AuditLogInterceptor({...})` per-route via
+`@UseInterceptors` instead if you do want a curated subset).
+
 ```ts
 // app.module.ts
 import { Module } from '@nestjs/common';
@@ -51,6 +58,10 @@ import { SentinelModule } from 'nest-sentinel';
       traceId: {}, // defaults: reads/generates X-Request-ID
       secureHeaders: {
         permissionsPolicy: 'geolocation=(), microphone=()',
+      },
+      auditLog: {
+        sink: async (entry) => console.log(JSON.stringify(entry)),
+        resolveActor: (req) => getActorFromJwt(req), // supply for meaningful actor identity
       },
     }),
   ],
@@ -129,6 +140,28 @@ by default (e.g. `text` or `raw`), register it explicitly with the same method �
 [NestJS FAQ on raw body/body parsers](https://docs.nestjs.com/faq/raw-body) — or, for full manual
 control, pass `{ bodyParser: false }` to `NestFactory.create` and wire `express.json({ limit })`
 etc. yourself before Nest's routing takes over.
+
+## What `AuditLogInterceptor` deliberately does not do
+
+- **No persistence.** `AuditLogInterceptor` never writes to disk, a database, or a remote log
+  service itself — it hands a structured `AuditLogEntry` to the `sink` you supply, and you wire
+  that to console/file/remote storage. This keeps nest-sentinel dependency-free and lets you reuse
+  whatever logging infrastructure you already have.
+- **No Merkle-tree checkpoints.** Tamper-evidence in v1 is a linear Schneier-Kelsey hash chain
+  (`tamperEvident: true` — each entry's `entry_hash` folds in the previous entry's hash), which is
+  enough to detect any modification or reordering of a single instance's log stream. Merkle-tree
+  checkpointing (as used by Certificate Transparency, for independently-verifiable audit proofs
+  across many logs) is a higher-assurance mechanism deferred until a real consumer need emerges.
+  Note also that the hash chain is module-scope, per-process state: a restart starts a fresh chain
+  from an empty `prev_hash`, which is a detectable, honest boundary rather than a bug.
+- **No retention enforcement.** `AuditLogInterceptor` emits entries; how long they're kept, when
+  they're purged, and how access to them is controlled is the sink/storage layer's responsibility,
+  not this module's.
+
+This design follows research on audit-log design covering NIST SP 800-92, the OWASP Logging
+Vocabulary Cheat Sheet, PCI-DSS Req.10, Schneier-Kelsey hash-chaining, and GDPR IP-retention
+guidance (informing the `truncated` default for `ipMode`) — same rationale as ts-sentinel's
+`auditLog`, ported to NestJS's interceptor model.
 
 ## Testing
 

@@ -7,15 +7,25 @@
 // wired here — NestJS guards are meant to be scoped per-route/per-controller via `@UseGuards`,
 // not applied globally by default, since which routes need auth/rate-limiting is
 // application-specific (unlike hardening headers/trace IDs, which are safe defaults everywhere).
-import { DynamicModule, MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
+import { DynamicModule, MiddlewareConsumer, Module, NestModule, Provider } from '@nestjs/common';
+import { APP_INTERCEPTOR } from '@nestjs/core';
 import { traceIdMiddleware, TraceIdOptions } from './traceid';
 import { secureHeadersMiddleware, SecureHeadersOptions } from './headers';
+import { AuditLogInterceptor, AuditLogOptions } from './auditlog';
 
 export interface SentinelModuleOptions {
   /** If provided, applies traceIdMiddleware globally with these options. */
   traceId?: TraceIdOptions;
   /** If provided, applies secureHeadersMiddleware globally with these options. */
   secureHeaders?: SecureHeadersOptions;
+  /**
+   * If provided, registers AuditLogInterceptor globally as an APP_INTERCEPTOR
+   * — unlike RateLimitGuard/ApiKeyGuard (deliberately per-route opt-in, see
+   * module doc above), most consumers want every request audited, not a
+   * manually-curated subset, so audit logging defaults to global-by-default
+   * here when this key is supplied.
+   */
+  auditLog?: AuditLogOptions;
 }
 
 /**
@@ -43,7 +53,16 @@ export class SentinelModule implements NestModule {
       }
     }
 
-    return { module: SentinelModuleForRoot };
+    const providers: Provider[] = [];
+    if (config.auditLog !== undefined) {
+      const AuditLogInterceptorClass = AuditLogInterceptor(config.auditLog);
+      providers.push({
+        provide: APP_INTERCEPTOR,
+        useValue: new AuditLogInterceptorClass(),
+      });
+    }
+
+    return { module: SentinelModuleForRoot, providers, exports: providers };
   }
 
   configure(_consumer: MiddlewareConsumer): void {
