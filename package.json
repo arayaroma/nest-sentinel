@@ -1,6 +1,6 @@
 {
   "name": "nest-sentinel",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "NestJS port of ts-sentinel: rate limiting, API key auth, secure headers, request timeout, trace-id middleware, and input validation — idiomatic Nest guards/middleware/interceptors, reusing ts-sentinel's framework-agnostic core (validate, rate-limit token bucket) as a real dependency.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

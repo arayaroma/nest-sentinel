@@ -27,7 +27,7 @@ Peer dependencies (already present in any NestJS/Express app): `@nestjs/common`,
 | `ratelimit` | `RateLimitGuard` | Token-bucket rate limiting, per-key/IP. | A04 |
 | `resource` | `TimeoutInterceptor` | Per-request wall-clock timeout (RxJS `timeout` operator). | resource exhaustion (A05-adjacent) |
 | `validate` | `nonEmpty`, `maxLength`, `oneOf` | Handler-boundary input validation. | A03 |
-| `auditlog` | `AuditLogInterceptor` | Structured, optionally tamper-evident who/what/when/how audit trail per request, emitted to a pluggable `sink`. | A09 (A08 with `tamperEvident: true`) |
+| `auditlog` | `AuditLogInterceptor` + `AuditLogExceptionFilter` | Structured, optionally tamper-evident who/what/when/how audit trail per request, emitted to a pluggable `sink`. Both halves are needed — see below. | A09 (A08 with `tamperEvident: true`) |
 | `sentinel` | `SentinelModule` | Single-import wiring for the global, stateless middleware (`traceid`, `headers`, and — if configured — `auditlog`). | — |
 
 See [`docs/owasp-coverage.md`](docs/owasp-coverage.md) for the full OWASP Top 10 (2021) mapping.
@@ -41,11 +41,30 @@ NestJS guards are meant to be applied (not global-by-default the way middleware 
 routes need auth/rate-limiting is application-specific. `TimeoutInterceptor` is likewise applied
 per-controller/route via `@UseInterceptors`.
 
-`AuditLogInterceptor` is wired through `SentinelModule.forRoot({ auditLog: {...} })` too, as an
-`APP_INTERCEPTOR` — unlike the guards, most consumers want *every* request audited rather than a
-manually-curated subset, so it defaults to global-by-default when the `auditLog` key is supplied
-(omit the key to skip audit logging entirely, or apply `AuditLogInterceptor({...})` per-route via
-`@UseInterceptors` instead if you do want a curated subset).
+`SentinelModule.forRoot({ auditLog: {...} })` wires BOTH `AuditLogInterceptor` (as an
+`APP_INTERCEPTOR`, success-path entries) AND `AuditLogExceptionFilter` (as an `APP_FILTER`,
+failure-path entries) — you need both, not just the interceptor. Reason: NestJS runs
+Guards → Interceptors → Pipes → Handler, so an exception a **Guard** throws (e.g. `AuthGuard`
+rejecting an unauthenticated request with 401) short-circuits *before* any interceptor's
+`intercept()` is ever called — an interceptor alone structurally cannot see that class of event,
+which is exactly the audit signal (repeated 401s on protected routes, brute-force-adjacent
+patterns) this module exists to capture. `AuditLogExceptionFilter`, registered globally, is the
+one place in Nest's request lifecycle that sees exceptions from Guards/Pipes/Interceptors/
+Handlers uniformly.
+
+**Important:** registering `AuditLogExceptionFilter` globally replaces Nest's built-in exception
+handling app-wide. It reproduces the same response shape (`HttpException.getResponse()`, or
+`{statusCode: 500, message: "Internal server error"}` for unknown errors) so existing error
+responses don't change shape as a side effect of enabling audit logging — but if you register
+your own global exception filter elsewhere too, only the last-registered one wins; don't
+double-register.
+
+Unlike the guards, most consumers want *every* request audited rather than a manually-curated
+subset, so both halves default to global-by-default when the `auditLog` key is supplied (omit the
+key to skip audit logging entirely; apply `AuditLogInterceptor({...})`/`AuditLogExceptionFilter({...})`
+per-route instead if you want a curated subset — though a per-route filter still only fires for
+routes it's actually reached, so it can't recover the Guard-rejection case either unless applied
+globally).
 
 ```ts
 // app.module.ts

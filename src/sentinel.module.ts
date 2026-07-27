@@ -8,10 +8,10 @@
 // not applied globally by default, since which routes need auth/rate-limiting is
 // application-specific (unlike hardening headers/trace IDs, which are safe defaults everywhere).
 import { DynamicModule, MiddlewareConsumer, Module, NestModule, Provider } from '@nestjs/common';
-import { APP_INTERCEPTOR } from '@nestjs/core';
+import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { traceIdMiddleware, TraceIdOptions } from './traceid';
 import { secureHeadersMiddleware, SecureHeadersOptions } from './headers';
-import { AuditLogInterceptor, AuditLogOptions } from './auditlog';
+import { AuditLogInterceptor, AuditLogExceptionFilter, AuditLogOptions } from './auditlog';
 
 export interface SentinelModuleOptions {
   /** If provided, applies traceIdMiddleware globally with these options. */
@@ -19,11 +19,19 @@ export interface SentinelModuleOptions {
   /** If provided, applies secureHeadersMiddleware globally with these options. */
   secureHeaders?: SecureHeadersOptions;
   /**
-   * If provided, registers AuditLogInterceptor globally as an APP_INTERCEPTOR
-   * — unlike RateLimitGuard/ApiKeyGuard (deliberately per-route opt-in, see
-   * module doc above), most consumers want every request audited, not a
-   * manually-curated subset, so audit logging defaults to global-by-default
-   * here when this key is supplied.
+   * If provided, registers BOTH AuditLogInterceptor (success-path entries)
+   * AND AuditLogExceptionFilter (failure-path entries, including exceptions
+   * thrown by Guards before any interceptor runs — e.g. AuthGuard rejecting
+   * an unauthenticated request) globally. Unlike RateLimitGuard/ApiKeyGuard
+   * (deliberately per-route opt-in, see module doc above), most consumers
+   * want every request audited, not a manually-curated subset, so audit
+   * logging defaults to global-by-default here when this key is supplied.
+   *
+   * IMPORTANT: registering the filter globally replaces Nest's built-in
+   * exception handling app-wide — AuditLogExceptionFilter reproduces the
+   * same response shape Nest's default filter produces, but if you also
+   * register your own global exception filter elsewhere, only one will win
+   * (Nest uses the last-registered global filter) — don't double-register.
    */
   auditLog?: AuditLogOptions;
 }
@@ -56,13 +64,14 @@ export class SentinelModule implements NestModule {
     const providers: Provider[] = [];
     if (config.auditLog !== undefined) {
       const AuditLogInterceptorClass = AuditLogInterceptor(config.auditLog);
-      providers.push({
-        provide: APP_INTERCEPTOR,
-        useValue: new AuditLogInterceptorClass(),
-      });
+      const AuditLogExceptionFilterClass = AuditLogExceptionFilter(config.auditLog);
+      providers.push(
+        { provide: APP_INTERCEPTOR, useValue: new AuditLogInterceptorClass() },
+        { provide: APP_FILTER, useValue: new AuditLogExceptionFilterClass() },
+      );
     }
 
-    // APP_INTERCEPTOR (like APP_GUARD/APP_FILTER) is a special multi-provider token NestJS
+    // APP_INTERCEPTOR/APP_FILTER (like APP_GUARD) are special multi-provider tokens NestJS
     // registers globally the moment it's declared in ANY loaded module's `providers` — it must
     // NOT also be re-exported (Nest throws UnknownExportException: "cannot export a
     // provider/module that is not a part of the currently processed module" if you try).

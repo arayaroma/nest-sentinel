@@ -1,9 +1,27 @@
-import { Controller, Get, HttpException, HttpStatus, INestApplication, UseInterceptors } from '@nestjs/common';
+import {
+  CanActivate,
+  Controller,
+  ExecutionContext,
+  Get,
+  HttpException,
+  HttpStatus,
+  INestApplication,
+  Injectable,
+  UnauthorizedException,
+  UseGuards,
+} from '@nestjs/common';
+import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
-import { AuditLogEntry, AuditLogInterceptor } from '../src/auditlog';
+import { AuditLogEntry, AuditLogExceptionFilter, AuditLogInterceptor, AuditLogOptions } from '../src/auditlog';
 import { SentinelModule } from '../src/sentinel.module';
-import { traceIdMiddleware } from '../src/traceid';
+
+@Injectable()
+class RejectingGuard implements CanActivate {
+  canActivate(_ctx: ExecutionContext): boolean {
+    throw new UnauthorizedException('no token');
+  }
+}
 
 @Controller()
 class TestController {
@@ -17,8 +35,9 @@ class TestController {
     throw new HttpException('nope', HttpStatus.FORBIDDEN);
   }
 
-  @Get('/malicious')
-  malicious(): { ok: boolean } {
+  @UseGuards(RejectingGuard)
+  @Get('/guarded')
+  guarded(): { ok: boolean } {
     return { ok: true };
   }
 }
@@ -28,24 +47,33 @@ function makeSink(): { sink: (e: AuditLogEntry) => void; entries: AuditLogEntry[
   return { sink: (e: AuditLogEntry): void => { entries.push(e); }, entries };
 }
 
-async function buildApp(interceptor: ReturnType<typeof AuditLogInterceptor>): Promise<INestApplication> {
-  @Controller()
-  class Ctrl extends TestController {}
-
-  const moduleRef = await Test.createTestingModule({
-    controllers: [Ctrl],
-  }).compile();
-
+/** Interceptor only — success-path entries. Matches what AuditLogInterceptor alone can see. */
+async function buildAppInterceptorOnly(opts: AuditLogOptions): Promise<INestApplication> {
+  const moduleRef = await Test.createTestingModule({ controllers: [TestController] }).compile();
   const app = moduleRef.createNestApplication();
-  app.useGlobalInterceptors(new interceptor());
+  app.useGlobalInterceptors(new (AuditLogInterceptor(opts))());
   await app.init();
   return app;
 }
 
-describe('AuditLogInterceptor (integration)', () => {
+/** Interceptor + filter — the real SentinelModule.forRoot({auditLog}) wiring. */
+async function buildAppFull(opts: AuditLogOptions): Promise<INestApplication> {
+  const moduleRef = await Test.createTestingModule({
+    controllers: [TestController],
+    providers: [
+      { provide: APP_INTERCEPTOR, useValue: new (AuditLogInterceptor(opts))() },
+      { provide: APP_FILTER, useValue: new (AuditLogExceptionFilter(opts))() },
+    ],
+  }).compile();
+  const app = moduleRef.createNestApplication();
+  await app.init();
+  return app;
+}
+
+describe('AuditLogInterceptor (success path)', () => {
   it('emits a well-formed entry on a successful request', async () => {
     const { sink, entries } = makeSink();
-    const app = await buildApp(AuditLogInterceptor({ sink }));
+    const app = await buildAppInterceptorOnly({ sink });
 
     const res = await request(app.getHttpServer()).get('/ok');
     expect(res.status).toBe(200);
@@ -67,12 +95,9 @@ describe('AuditLogInterceptor (integration)', () => {
   it('picks up trace_id from a composed traceIdMiddleware, omits it when absent', async () => {
     const { sink, entries } = makeSink();
 
-    @Controller()
-    class Ctrl extends TestController {}
-
     const moduleRef = await Test.createTestingModule({
       imports: [SentinelModule.forRoot({ traceId: {} })],
-      controllers: [Ctrl],
+      controllers: [TestController],
     }).compile();
 
     const app = moduleRef.createNestApplication();
@@ -89,46 +114,20 @@ describe('AuditLogInterceptor (integration)', () => {
     await app.close();
   });
 
-  it('derives outcome per status bucket: success/denied/failure', async () => {
+  it('does NOT see a Guard-rejected request when applied alone (the gap AuditLogExceptionFilter exists to close)', async () => {
     const { sink, entries } = makeSink();
-    const app = await buildApp(AuditLogInterceptor({ sink }));
+    const app = await buildAppInterceptorOnly({ sink });
 
-    const res = await request(app.getHttpServer()).get('/boom');
-    expect(res.status).toBe(403);
+    const res = await request(app.getHttpServer()).get('/guarded');
+    expect(res.status).toBe(401); // the rejection still happens correctly...
 
     await new Promise((r) => setImmediate(r));
-    expect(entries).toHaveLength(1);
-    expect(entries[0].http.status_code).toBe(403);
-    expect(entries[0].outcome).toBe('denied');
-
-    await app.close();
-  });
-
-  it('route handler throwing still returns the real error response to the client AND emits a failure/denied entry', async () => {
-    const { sink, entries } = makeSink();
-    const app = await buildApp(AuditLogInterceptor({ sink }));
-
-    const res = await request(app.getHttpServer()).get('/boom');
-
-    // Client-visible response is the real Nest error response, untouched.
-    expect(res.status).toBe(403);
-    expect(res.body.message).toBe('nope');
-
-    await new Promise((r) => setImmediate(r));
-    expect(entries).toHaveLength(1);
-    expect(entries[0].outcome).toBe('denied');
-    expect(entries[0].http.status_code).toBe(403);
+    expect(entries).toHaveLength(0); // ...but the interceptor alone never observes it.
 
     await app.close();
   });
 
   it('sanitizes control characters and caps field length in path/user-agent', async () => {
-    // Node's own http client rejects raw control characters in header values
-    // outright (it won't even let us send them), so we prove sanitizeField()
-    // works by forging the User-Agent header directly on the underlying
-    // Express Request before the interceptor reads it — mirroring what a
-    // less strict HTTP client/proxy could still let through at the TCP
-    // level. This exercises both control-char stripping and the length cap.
     @Controller()
     class ForgingController {
       @Get('/forged')
@@ -171,7 +170,7 @@ describe('AuditLogInterceptor (integration)', () => {
 
     for (const { mode, assert } of modes) {
       const { sink, entries } = makeSink();
-      const app = await buildApp(AuditLogInterceptor({ sink, ipMode: mode }));
+      const app = await buildAppInterceptorOnly({ sink, ipMode: mode });
 
       const res = await request(app.getHttpServer()).get('/ok').set('X-Forwarded-For', '1.2.3.4');
       expect(res.status).toBe(200);
@@ -184,34 +183,12 @@ describe('AuditLogInterceptor (integration)', () => {
     }
   });
 
-  it('hash chain is content-dependent (tamper-detectable), not hardcoded', async () => {
-    const { sink, entries } = makeSink();
-    const app = await buildApp(AuditLogInterceptor({ sink, tamperEvident: true }));
-
-    await request(app.getHttpServer()).get('/ok');
-    await request(app.getHttpServer()).get('/ok');
-    await new Promise((r) => setImmediate(r));
-
-    expect(entries).toHaveLength(2);
-    expect(entries[0].entry_hash).toBeDefined();
-    expect(entries[1].prev_hash).toBe(entries[0].entry_hash);
-    expect(entries[0].entry_hash).not.toBe(entries[1].entry_hash);
-
-    // Tamper-detection: recomputing the hash over a mutated copy must differ.
-    const tampered = { ...entries[0], http: { ...entries[0].http, status_code: 999 } };
-    expect(JSON.stringify(tampered)).not.toBe(JSON.stringify(entries[0]));
-
-    await app.close();
-  });
-
   it('a throwing sink does not break the client-visible response', async () => {
-    const app = await buildApp(
-      AuditLogInterceptor({
-        sink: () => {
-          throw new Error('sink exploded');
-        },
-      }),
-    );
+    const app = await buildAppInterceptorOnly({
+      sink: () => {
+        throw new Error('sink exploded');
+      },
+    });
 
     const res = await request(app.getHttpServer()).get('/ok');
     expect(res.status).toBe(200);
@@ -221,17 +198,103 @@ describe('AuditLogInterceptor (integration)', () => {
   });
 
   it('a rejecting async sink does not break the client-visible response', async () => {
-    const app = await buildApp(
-      AuditLogInterceptor({
-        sink: async () => {
-          throw new Error('async sink exploded');
-        },
-      }),
-    );
+    const app = await buildAppInterceptorOnly({
+      sink: async () => {
+        throw new Error('async sink exploded');
+      },
+    });
 
     const res = await request(app.getHttpServer()).get('/ok');
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true });
+
+    await app.close();
+  });
+});
+
+describe('AuditLogInterceptor + AuditLogExceptionFilter (full wiring, matches SentinelModule.forRoot)', () => {
+  it('handler-thrown exception: real error response preserved, failure/denied entry emitted', async () => {
+    const { sink, entries } = makeSink();
+    const app = await buildAppFull({ sink });
+
+    const res = await request(app.getHttpServer()).get('/boom');
+
+    expect(res.status).toBe(403);
+    expect(res.body.message).toBe('nope');
+
+    await new Promise((r) => setImmediate(r));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].outcome).toBe('denied');
+    expect(entries[0].http.status_code).toBe(403);
+
+    await app.close();
+  });
+
+  it('Guard-rejected request: real 401 response preserved, entry STILL emitted (the gap the filter closes)', async () => {
+    const { sink, entries } = makeSink();
+    const app = await buildAppFull({ sink });
+
+    const res = await request(app.getHttpServer()).get('/guarded');
+
+    expect(res.status).toBe(401);
+    expect(res.body.message).toBe('no token');
+
+    await new Promise((r) => setImmediate(r));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].outcome).toBe('denied');
+    expect(entries[0].http.status_code).toBe(401);
+    expect(entries[0].http.path).toBe('/guarded');
+
+    await app.close();
+  });
+
+  it('success path still only logs once (no double-logging between interceptor and filter)', async () => {
+    const { sink, entries } = makeSink();
+    const app = await buildAppFull({ sink });
+
+    const res = await request(app.getHttpServer()).get('/ok');
+    expect(res.status).toBe(200);
+
+    await new Promise((r) => setImmediate(r));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].outcome).toBe('success');
+
+    await app.close();
+  });
+
+  it('derives outcome per status bucket: success/denied/failure', async () => {
+    const { sink, entries } = makeSink();
+    const app = await buildAppFull({ sink });
+
+    await request(app.getHttpServer()).get('/ok');
+    await request(app.getHttpServer()).get('/boom');
+    await request(app.getHttpServer()).get('/guarded');
+
+    await new Promise((r) => setImmediate(r));
+    expect(entries).toHaveLength(3);
+    const byPath = Object.fromEntries(entries.map((e) => [e.http.path, e]));
+    expect(byPath['/ok'].outcome).toBe('success');
+    expect(byPath['/boom'].outcome).toBe('denied'); // 403
+    expect(byPath['/guarded'].outcome).toBe('denied'); // 401
+
+    await app.close();
+  });
+
+  it('hash chain is content-dependent (tamper-detectable), not hardcoded, and shared across interceptor + filter entries', async () => {
+    const { sink, entries } = makeSink();
+    const app = await buildAppFull({ sink, tamperEvident: true });
+
+    await request(app.getHttpServer()).get('/ok');
+    await request(app.getHttpServer()).get('/boom');
+    await new Promise((r) => setImmediate(r));
+
+    expect(entries).toHaveLength(2);
+    expect(entries[0].entry_hash).toBeDefined();
+    expect(entries[1].prev_hash).toBe(entries[0].entry_hash);
+    expect(entries[0].entry_hash).not.toBe(entries[1].entry_hash);
+
+    const tampered = { ...entries[0], http: { ...entries[0].http, status_code: 999 } };
+    expect(JSON.stringify(tampered)).not.toBe(JSON.stringify(entries[0]));
 
     await app.close();
   });
